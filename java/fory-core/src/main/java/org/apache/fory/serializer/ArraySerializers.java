@@ -35,6 +35,7 @@ import org.apache.fory.serializer.collection.ForyArrayAsListSerializer;
 import org.apache.fory.type.GenericType;
 import org.apache.fory.type.TypeUtils;
 import org.apache.fory.type.Types;
+import org.apache.fory.util.ArrayCompressionUtils;
 import org.apache.fory.util.Preconditions;
 
 /** Serializers for array types. */
@@ -451,6 +452,34 @@ public class ArraySerializers {
 
     @Override
     public void write(MemoryBuffer buffer, int[] value) {
+      if (fory.getBufferCallback() == null && fory.getConfig().compressIntArray()) {
+        final int compressionType = ArrayCompressionUtils.determineIntCompressionType(value);
+
+        if (compressionType != ArrayCompressionUtils.COMPRESSION_NONE) {
+          buffer.writeByte((byte) compressionType);
+          buffer.writeVarUint32Small7(value.length);
+          if (compressionType == ArrayCompressionUtils.COMPRESSION_BYTE) {
+            byte[] bytes = ArrayCompressionUtils.compressToBytes(value);
+            int wi = buffer.writerIndex();
+            int end = wi + bytes.length;
+            buffer.ensure(end);
+            buffer.copyFromUnsafe(wi, bytes, Platform.BYTE_ARRAY_OFFSET, bytes.length);
+            buffer.writerIndex(end);
+            return;
+          } else if (compressionType == ArrayCompressionUtils.COMPRESSION_SHORT) {
+            short[] shorts = ArrayCompressionUtils.compressToShorts(value);
+            int payloadLen = shorts.length * 2;
+            int wi = buffer.writerIndex();
+            int end = wi + payloadLen;
+            buffer.ensure(end);
+            buffer.copyFromUnsafe(wi, shorts, Platform.SHORT_ARRAY_OFFSET, payloadLen);
+            buffer.writerIndex(end);
+            return;
+          }
+        }
+      }
+
+      // Legacy uncompressed format
       if (fory.getBufferCallback() == null) {
         int size = Math.multiplyExact(value.length, elemSize);
         buffer.writePrimitiveArrayWithSize(value, offset, size);
@@ -467,18 +496,54 @@ public class ArraySerializers {
 
     @Override
     public int[] read(MemoryBuffer buffer) {
+      // OOB remains legacy/raw
       if (fory.isPeerOutOfBandEnabled()) {
         MemoryBuffer buf = fory.readBufferObject(buffer);
         int size = buf.remaining();
         int numElements = size / elemSize;
         int[] values = new int[numElements];
-        buf.copyToUnsafe(0, values, offset, size);
+        if (size > 0) {
+          buf.copyToUnsafe(0, values, offset, size);
+        }
         return values;
-      } else {
+      }
+
+      if (fory.getConfig().compressIntArray()) {
+        int readerIndex = buffer.readerIndex();
+        int compressionType = buffer.readByte() & 0xFF;
+
+        if (compressionType == ArrayCompressionUtils.COMPRESSION_BYTE
+            || compressionType == ArrayCompressionUtils.COMPRESSION_SHORT) {
+          int originalLen = buffer.readVarUint32Small7();
+          if (originalLen == 0) {
+            return new int[0];
+          }
+
+          if (compressionType == ArrayCompressionUtils.COMPRESSION_BYTE) {
+            byte[] payload = new byte[originalLen];
+            buffer.readToUnsafe(payload, Platform.BYTE_ARRAY_OFFSET, originalLen);
+            return ArrayCompressionUtils.decompressFromBytes(payload);
+          } else {
+            {
+              int payloadSize = originalLen * 2;
+              short[] tmp = new short[originalLen];
+              buffer.readToUnsafe(tmp, Platform.SHORT_ARRAY_OFFSET, payloadSize);
+              return ArrayCompressionUtils.decompressFromShorts(tmp);
+            }
+          }
+        } else {
+          // Not a compressed format, reset and fall through to legacy format
+          buffer.readerIndex(readerIndex);
+        }
+      }
+      // Legacy uncompressed format
+      {
         int size = buffer.readVarUint32Small7();
         int numElements = size / elemSize;
         int[] values = new int[numElements];
-        buffer.readToUnsafe(values, offset, size);
+        if (size > 0) {
+          buffer.readToUnsafe(values, offset, size);
+        }
         return values;
       }
     }
@@ -492,12 +557,38 @@ public class ArraySerializers {
 
     @Override
     public void write(MemoryBuffer buffer, long[] value) {
-      if (fory.getBufferCallback() == null) {
-        int size = Math.multiplyExact(value.length, elemSize);
-        buffer.writePrimitiveArrayWithSize(value, offset, size);
+      // Use config to determine format
+      if (fory.getBufferCallback() == null && fory.getConfig().compressLongArray()) {
+        final int compressionType = ArrayCompressionUtils.determineLongCompressionType(value);
+        buffer.writeByte((byte) compressionType);
+        buffer.writeVarUint32Small7(value.length);
+
+        if (compressionType == ArrayCompressionUtils.COMPRESSION_INT) {
+          int[] ints = ArrayCompressionUtils.compressToInts(value);
+          int payloadLen = ints.length * 4;
+          int wi = buffer.writerIndex();
+          int end = wi + payloadLen;
+          buffer.ensure(end);
+          buffer.copyFromUnsafe(wi, ints, Platform.INT_ARRAY_OFFSET, payloadLen);
+          buffer.writerIndex(end);
+        } else {
+          int size = Math.multiplyExact(value.length, elemSize);
+          int wi = buffer.writerIndex();
+          int end = wi + size;
+          buffer.ensure(end);
+          if (size > 0) {
+            buffer.copyFromUnsafe(wi, value, offset, size);
+          }
+          buffer.writerIndex(end);
+        }
       } else {
-        fory.writeBufferObject(
-            buffer, new PrimitiveArrayBufferObject(value, offset, elemSize, value.length));
+        if (fory.getBufferCallback() == null) {
+          int size = Math.multiplyExact(value.length, elemSize);
+          buffer.writePrimitiveArrayWithSize(value, offset, size);
+        } else {
+          fory.writeBufferObject(
+              buffer, new PrimitiveArrayBufferObject(value, offset, elemSize, value.length));
+        }
       }
     }
 
@@ -513,13 +604,47 @@ public class ArraySerializers {
         int size = buf.remaining();
         int numElements = size / elemSize;
         long[] values = new long[numElements];
-        buf.copyToUnsafe(0, values, offset, size);
+        if (size > 0) {
+          buf.copyToUnsafe(0, values, offset, size);
+        }
         return values;
+      }
+
+      if (fory.getConfig().compressLongArray()) {
+        int compressionType = buffer.readByte() & 0xFF;
+        int originalLen = buffer.readVarUint32Small7();
+
+        if (originalLen == 0) {
+          return new long[0];
+        }
+
+        switch (compressionType) {
+          case ArrayCompressionUtils.COMPRESSION_INT:
+            {
+              int payloadSize = originalLen * 4;
+              int[] ints = new int[originalLen];
+              buffer.readToUnsafe(ints, Platform.INT_ARRAY_OFFSET, payloadSize);
+              return ArrayCompressionUtils.decompressFromInts(ints);
+            }
+          case ArrayCompressionUtils.COMPRESSION_NONE:
+            {
+              long[] values = new long[originalLen];
+              int size = originalLen * elemSize;
+              if (size > 0) {
+                buffer.readToUnsafe(values, offset, size);
+              }
+              return values;
+            }
+          default:
+            throw new IllegalStateException("Unknown long[] compression type: " + compressionType);
+        }
       } else {
         int size = buffer.readVarUint32Small7();
         int numElements = size / elemSize;
         long[] values = new long[numElements];
-        buffer.readToUnsafe(values, offset, size);
+        if (size > 0) {
+          buffer.readToUnsafe(values, offset, size);
+        }
         return values;
       }
     }
